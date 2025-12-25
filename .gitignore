@@ -1,6 +1,21 @@
-# Processed artifacts
+# Data / artifacts (VERY important)
 data/
 data/processed/
 *.parquet
+*.csv
+*.jsonl
 *.pkl
 *.joblib
+*.model
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.env
+.venv/
