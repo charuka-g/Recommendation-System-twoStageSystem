@@ -1,0 +1,6 @@
+# Processed artifacts
+data/
+data/processed/
+*.parquet
+*.pkl
+*.joblib
