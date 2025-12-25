@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import pickle
 import joblib
+import xgboost as xgb
 from pathlib import Path
 import numpy as np
 
@@ -14,12 +15,106 @@ MODELS_DIR = PROJECT_ROOT / "models"
 st.set_page_config(
     page_title="All Beauty - Two-Stage Recommendation",
     page_icon="💄",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# Title
-st.title("💄 All Beauty — Two-Stage Recommendation System")
-st.markdown("---")
+# Custom CSS for better UI
+st.markdown("""
+    <style>
+    .main .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+    }
+    
+    .recommendation-card {
+        background: white;
+        border-radius: 12px;
+        padding: 1rem;
+        margin-bottom: 1rem;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        transition: transform 0.2s, box-shadow 0.2s;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        border: 1px solid #e5e7eb;
+    }
+    
+    .recommendation-card:hover {
+        transform: translateY(-4px);
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    }
+    
+    .image-container {
+        width: 100%;
+        height: 200px;
+        overflow: hidden;
+        border-radius: 8px;
+        margin-bottom: 0.75rem;
+        background: #f3f4f6;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    
+    .image-container img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+    }
+    
+    .card-title {
+        font-size: 0.9rem;
+        font-weight: 600;
+        color: #1f2937;
+        margin-bottom: 0.5rem;
+        line-height: 1.4;
+        min-height: 2.5em;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+    }
+    
+    .card-info {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-top: auto;
+        padding-top: 0.5rem;
+        border-top: 1px solid #e5e7eb;
+    }
+    
+    .price-tag {
+        font-size: 1rem;
+        font-weight: 700;
+        color: #059669;
+    }
+    
+    .score-badge {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 0.25rem 0.75rem;
+        border-radius: 20px;
+        font-size: 0.8rem;
+        font-weight: 600;
+    }
+    
+    .main-header {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 2rem;
+        border-radius: 12px;
+        color: white;
+        margin-bottom: 2rem;
+        text-align: center;
+    }
+    
+    .main-header h1 {
+        color: white;
+        margin-bottom: 0.5rem;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
 # Cache data loading functions
 @st.cache_data
@@ -49,9 +144,9 @@ def load_svd_model():
     return model_data
 
 @st.cache_resource
-def load_xgb_pipeline():
-    """Load XGBoost ranking pipeline."""
-    pipeline_path = MODELS_DIR / "xgb_ranker.joblib"
+def load_xgb_artifacts():
+    """Load XGBoost ranking artifacts (metadata + model path)."""
+    pipeline_path = MODELS_DIR / "ranking_pipeline.joblib"
     return joblib.load(pipeline_path)
 
 # Load data
@@ -60,7 +155,7 @@ try:
     df_user_features = load_user_features()
     df_item_features = load_item_features()
     svd_data = load_svd_model()
-    xgb_pipeline = load_xgb_pipeline()
+    xgb_artifacts = load_xgb_artifacts()
 except FileNotFoundError as e:
     st.error(f"Error loading data or models: {e}")
     st.info("Please run the notebooks first to generate the required files.")
@@ -69,6 +164,7 @@ except FileNotFoundError as e:
 # Extract model components
 svd_model = svd_data['model']
 svd_trainset = svd_data['trainset']
+
 # Convert user_seen_items to sets if they're lists
 user_seen_items_raw = svd_data['user_seen_items']
 user_seen_items = {}
@@ -79,63 +175,81 @@ for k, v in user_seen_items_raw.items():
         user_seen_items[k] = v
     else:
         user_seen_items[k] = {v} if v else set()
+
 all_items = set(svd_data['all_items'])
 
-preprocessor = xgb_pipeline['preprocessor']
-xgb_model = xgb_pipeline['model']
-numeric_features = xgb_pipeline['numeric_features']
-categorical_features = xgb_pipeline['categorical_features']
+# Ranking artifacts
+feature_cols = xgb_artifacts["feature_cols"]
+user_code_map = xgb_artifacts["user_code_map"]
+item_code_map = xgb_artifacts["item_code_map"]
+user_stats = xgb_artifacts["user_stats"]
+item_stats = xgb_artifacts["item_stats"]
+xgb_model_path = xgb_artifacts["xgb_model_path"]
+
+# Load booster
+booster = xgb.Booster()
+booster.load_model(xgb_model_path)
 
 # Sidebar controls
 st.sidebar.header("⚙️ Configuration")
 
+# Filter to only 500 users
+available_users_all = sorted(df_ratings['user_id'].unique())
+available_users = available_users_all[:500] if len(available_users_all) > 500 else available_users_all
+
 # User selection
-available_users = sorted(df_ratings['user_id'].unique())
 selected_user = st.sidebar.selectbox(
-    "Select User ID",
+    "👤 Select User ID",
     options=available_users,
-    index=0
+    index=0,
+    help="Choose a user to generate personalized recommendations"
 )
+
+# Display user stats if available
+if selected_user in user_stats.index:
+    user_stat = user_stats.loc[selected_user]
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 📊 User Statistics")
+    st.sidebar.metric("Total Ratings", int(user_stat.get('user_num_ratings', 0)))
+    st.sidebar.metric("Avg Rating Given", f"{user_stat.get('user_mean_rating', 0):.2f}")
 
 # Retrieval candidates slider
 n_candidates = st.sidebar.slider(
-    "Retrieval Candidates",
+    "🔍 Retrieval Candidates",
     min_value=20,
     max_value=300,
     value=100,
-    step=10
+    step=10,
+    help="Number of candidates to retrieve in the first stage"
 )
 
 # Top-K slider
 top_k = st.sidebar.slider(
-    "Show Top-K Recommendations",
+    "📈 Show Top-K Recommendations",
     min_value=5,
     max_value=30,
     value=10,
-    step=1
+    step=1,
+    help="Number of top recommendations to display"
 )
 
 # Recommend button
-recommend_button = st.sidebar.button("🔍 Recommend", type="primary")
+recommend_button = st.sidebar.button("🚀 Generate Recommendations", type="primary", use_container_width=True)
 
-# Helper function for retrieval
+# Helper functions
 def get_candidates(user_id: str, n: int = 100):
     """Get top-n candidate items for a user using SVD predictions."""
-    # Get items user has NOT interacted with
     seen = user_seen_items.get(user_id, set())
     unseen_items = all_items - seen
     
     if len(unseen_items) == 0:
         return []
     
-    # Get user internal ID
     try:
         user_inner_id = svd_trainset.to_inner_uid(user_id)
     except ValueError:
-        # User not in training set (cold start)
         return []
     
-    # Predict ratings for all unseen items
     predictions = []
     for item_asin in unseen_items:
         try:
@@ -143,142 +257,165 @@ def get_candidates(user_id: str, n: int = 100):
             pred = svd_model.predict(user_inner_id, item_inner_id)
             predictions.append((item_asin, pred.est))
         except ValueError:
-            # Item not in training set, skip
             continue
     
-    # Sort by predicted score descending and return top-n
     predictions.sort(key=lambda x: x[1], reverse=True)
     return predictions[:n]
 
-# Helper function for ranking
-def rank_candidates(user_id: str, candidate_asins: list):
-    """Rank candidate items using XGBoost model."""
-    if len(candidate_asins) == 0:
+def rank_candidates(user_id: str, candidates_with_scores: list):
+    """Rank candidate items using the trained booster and feature stats."""
+    if len(candidates_with_scores) == 0:
         return []
-    
-    # Create feature rows for candidates
-    candidate_data = []
-    for asin in candidate_asins:
-        row = {'user_id': user_id, 'parent_asin': asin}
-        candidate_data.append(row)
-    
-    df_candidates = pd.DataFrame(candidate_data)
-    
-    # Join with user features
-    df_candidates = df_candidates.merge(df_user_features, on='user_id', how='left')
-    
-    # Join with item features
-    df_candidates = df_candidates.merge(df_item_features, on='parent_asin', how='left')
-    
-    # Prepare features
-    X = df_candidates[numeric_features + categorical_features].copy()
-    
-    # Fill NaN
-    for col in numeric_features:
-        if col in X.columns:
-            median_val = df_user_features[col].median() if col in df_user_features.columns else 0.0
-            X[col] = X[col].fillna(median_val)
-    
-    for col in categorical_features:
-        if col in X.columns:
-            X[col] = X[col].fillna("unknown")
-    
-    # Preprocess
-    X_processed = preprocessor.transform(X)
-    
-    # Predict
-    scores = xgb_model.predict(X_processed)
-    
-    # Combine with ASINs
+
+    mf_est_map = dict(candidates_with_scores)
+    candidate_asins = [asin for asin, _ in candidates_with_scores]
+
+    df_tmp = pd.DataFrame({
+        "user_id": [user_id] * len(candidate_asins),
+        "parent_asin": candidate_asins,
+    })
+    df_tmp["mf_est"] = df_tmp["parent_asin"].map(mf_est_map).fillna(0.0)
+
+    # Merge stats
+    df_tmp = df_tmp.merge(user_stats, on="user_id", how="left")
+    df_tmp = df_tmp.merge(item_stats, on="parent_asin", how="left")
+
+    for col in ["user_num_ratings", "user_mean_rating", "item_num_ratings", "item_mean_rating"]:
+        df_tmp[col] = df_tmp[col].fillna(0)
+
+    df_tmp["user_code"] = df_tmp["user_id"].map(user_code_map).fillna(-1).astype(int)
+    df_tmp["item_code"] = df_tmp["parent_asin"].map(item_code_map).fillna(-1).astype(int)
+
+    # Features in the order saved
+    X_cand = df_tmp[feature_cols].to_numpy()
+    dtest = xgb.DMatrix(X_cand)
+    scores = booster.predict(dtest)
+
     results = list(zip(candidate_asins, scores))
     results.sort(key=lambda x: x[1], reverse=True)
-    
     return results
+
+def is_valid_item(title, image_url):
+    """Check if item has valid title and image."""
+    title_valid = title is not None and pd.notna(title) and str(title).strip()
+    image_valid = image_url is not None and pd.notna(image_url) and str(image_url).strip()
+    return title_valid and image_valid
+
+# Main header
+st.markdown("""
+    <div class="main-header">
+        <h1>💄 All Beauty — Two-Stage Recommendation System</h1>
+        <p style="font-size: 1.1rem; opacity: 0.9;">Personalized product recommendations powered by Matrix Factorization & XGBoost</p>
+    </div>
+""", unsafe_allow_html=True)
 
 # Main content
 if recommend_button or 'recommendations' not in st.session_state:
-    with st.spinner("Generating recommendations..."):
+    with st.spinner("🔄 Generating personalized recommendations..."):
         # Retrieval stage
         candidates = get_candidates(selected_user, n=n_candidates)
         
         if len(candidates) == 0:
-            st.warning(f"No candidates found for user {selected_user}")
+            st.warning(f"⚠️ No candidates found for user {selected_user}")
+            st.info("💡 Try selecting a different user or check if the user exists in the training data.")
             st.stop()
         
-        candidate_asins = [asin for asin, _ in candidates]
-        
         # Ranking stage
-        ranked_results = rank_candidates(selected_user, candidate_asins)
+        ranked_results = rank_candidates(selected_user, candidates)
         
         # Get top-k
         top_results = ranked_results[:top_k]
         
+        # Filter out items with null titles or images
+        filtered_results = []
+        for asin, score in top_results:
+            item_info = df_item_features[df_item_features['parent_asin'] == asin]
+            if len(item_info) > 0:
+                item = item_info.iloc[0]
+                title = item.get('title_clean', None)
+                image_url = item.get('image_url', None)
+                
+                if is_valid_item(title, image_url):
+                    filtered_results.append((asin, score))
+        
         # Store in session state
-        st.session_state['recommendations'] = top_results
+        st.session_state['recommendations'] = filtered_results
         st.session_state['user_id'] = selected_user
+        st.session_state['original_count'] = len(top_results)
+        st.session_state['filtered_count'] = len(filtered_results)
 
 # Display recommendations
 if 'recommendations' in st.session_state:
-    st.header(f"📊 Recommendations for User: `{st.session_state['user_id']}`")
-    st.markdown(f"Showing top **{len(st.session_state['recommendations'])}** recommendations")
-    st.markdown("---")
-    
     recommendations = st.session_state['recommendations']
     
-    # Create grid layout (5 columns)
-    n_cols = 5
-    n_rows = (len(recommendations) + n_cols - 1) // n_cols
-    
-    for row_idx in range(n_rows):
-        cols = st.columns(n_cols)
-        for col_idx in range(n_cols):
-            item_idx = row_idx * n_cols + col_idx
-            if item_idx < len(recommendations):
-                asin, score = recommendations[item_idx]
-                
-                # Get item details
-                item_info = df_item_features[df_item_features['parent_asin'] == asin]
-                
-                if len(item_info) > 0:
-                    item = item_info.iloc[0]
-                    title = item.get('title_clean', 'N/A')
-                    price = item.get('price_float', None)
-                    image_url = item.get('image_url', None)
-                else:
-                    title = 'N/A'
-                    price = None
-                    image_url = None
-                
-                with cols[col_idx]:
-                    # Card container
-                    with st.container():
-                        # Image
-                        if image_url and pd.notna(image_url) and str(image_url).strip():
-                            try:
-                                st.image(str(image_url), use_container_width=True)
-                            except Exception as e:
-                                st.markdown("🖼️ *Image unavailable*")
-                        else:
-                            st.markdown("🖼️ *Image unavailable*")
+    if len(recommendations) == 0:
+        st.warning("⚠️ No recommendations available after filtering (all items had missing titles or images).")
+        st.info("💡 Try increasing the number of candidates or selecting a different user.")
+    else:
+        # Stats display
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("📊 Total Recommendations", len(recommendations))
+        with col2:
+            if 'original_count' in st.session_state:
+                filtered = st.session_state.get('original_count', 0) - len(recommendations)
+                st.metric("🔍 Filtered Out", filtered)
+        with col3:
+            avg_score = np.mean([score for _, score in recommendations]) if recommendations else 0
+            st.metric("⭐ Avg Score", f"{avg_score:.3f}")
+        
+        st.markdown("---")
+        
+        # Create responsive grid layout (3 columns)
+        n_cols = 3
+        
+        for i in range(0, len(recommendations), n_cols):
+            cols = st.columns(n_cols)
+            for j, col in enumerate(cols):
+                item_idx = i + j
+                if item_idx < len(recommendations):
+                    asin, score = recommendations[item_idx]
+                    
+                    # Get item details
+                    item_info = df_item_features[df_item_features['parent_asin'] == asin]
+                    
+                    if len(item_info) > 0:
+                        item = item_info.iloc[0]
+                        title = item.get('title_clean', 'N/A')
+                        price = item.get('price_float', None)
+                        image_url = item.get('image_url', None)
                         
-                        # Title
-                        st.markdown(f"**{title[:60]}{'...' if len(str(title)) > 60 else ''}**")
+                        # Format price
+                        price_display = f"${price:.2f}" if price is not None and pd.notna(price) else "N/A"
                         
-                        # Price
-                        if price and pd.notna(price):
-                            st.markdown(f"💰 ${price:.2f}")
-                        else:
-                            st.markdown("💰 Price: N/A")
+                        # Escape title for HTML
+                        title_escaped = str(title).replace('"', '&quot;').replace("'", "&#39;")
+                        title_short = title_escaped[:50] if len(title_escaped) > 50 else title_escaped
                         
-                        # Score
-                        st.markdown(f"⭐ Score: `{score:.3f}`")
-                        
-                        # ASIN
-                        st.caption(f"ASIN: `{asin}`")
-                        
-                        st.markdown("---")
+                        with col:
+                            # Card container with custom styling
+                            card_html = f"""
+                            <div class="recommendation-card">
+                                <div class="image-container">
+                                    <img src="{image_url}" alt="{title_short}" onerror="this.style.display='none'; this.parentElement.innerHTML='<div style=\\'padding: 2rem; text-align: center; color: #6b7280;\\'>🖼️ Image unavailable</div>';">
+                                </div>
+                                <div class="card-title">{title_escaped}</div>
+                                <div class="card-info">
+                                    <span class="price-tag">{price_display}</span>
+                                    <span class="score-badge">⭐ {score:.3f}</span>
+                                </div>
+                                <div style="margin-top: 0.5rem; font-size: 0.75rem; color: #6b7280;">
+                                    ASIN: <code>{asin}</code>
+                                </div>
+                            </div>
+                            """
+                            st.markdown(card_html, unsafe_allow_html=True)
 
 # Footer
 st.markdown("---")
-st.markdown("**Two-Stage Recommendation System:** Retrieval (SVD) → Ranking (XGBoost)")
-
+st.markdown("""
+    <div style="text-align: center; color: #6b7280; padding: 1rem;">
+        <p><strong>Two-Stage Recommendation System:</strong> Retrieval (SVD) → Ranking (XGBoost)</p>
+        <p style="font-size: 0.85rem;">Powered by Matrix Factorization & Gradient Boosting</p>
+    </div>
+""", unsafe_allow_html=True)
